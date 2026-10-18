@@ -186,7 +186,7 @@ compared with FFmpeg's (picture PSNR measured in RGB):
 | FLAC to WAV | Bit-identical samples |
 | Bilinear scale, crop and hflip | Bit-identical to FFmpeg |
 | Bicubic scale | 53.3 dB PSNR against FFmpeg's output, visually identical |
-| yuv420p to yuv444p | 39.1 dB PSNR against FFmpeg's output: the tools place and interpolate subsampled chroma differently (ferrompeg assumes chroma centered between luma samples, as in JPEG and MPEG-1, and interpolates linearly) |
+| yuv420p to yuv444p | 39.1 dB PSNR against FFmpeg's output. Luma is bit-identical; the difference is in chroma, which ferrompeg takes as centered between luma samples (as in JPEG and MPEG-1) and interpolates linearly. Given the same choices (`scale=flags=bilinear:in_h_chr_pos=128:in_v_chr_pos=128`), FFmpeg's output is bit-identical to ferrompeg's |
 | Resample to 48 kHz | 55.9 dB SNR against FFmpeg's output |
 | highpass, volume, afade | 78.8 dB SNR against FFmpeg's output |
 | atempo | Different algorithm; lengths differ by 7 ms, not comparable sample by sample |
@@ -204,6 +204,9 @@ everywhere).
 - One input per run, single source graphs for `-f lavfi`, constant frame rate
   video only, YUV in BT.601 limited range.
 - WAV output is limited to 4 GiB (no RF64).
+- FLAC frames are encoded and decoded in batches of 32 to use every core, so
+  output written to a pipe arrives in bursts of about 3 seconds of audio at
+  44.1 kHz.
 
 ## Roadmap
 
