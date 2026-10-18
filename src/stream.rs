@@ -25,6 +25,7 @@ impl fmt::Display for MediaType {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CodecId {
     PcmU8,
+    PcmS8,
     PcmS16Le,
     PcmS16Be,
     PcmS24Le,
@@ -43,8 +44,9 @@ pub enum CodecId {
 }
 
 impl CodecId {
-    pub const ALL: [CodecId; 16] = [
+    pub const ALL: [CodecId; 17] = [
         CodecId::PcmU8,
+        CodecId::PcmS8,
         CodecId::PcmS16Le,
         CodecId::PcmS16Be,
         CodecId::PcmS24Le,
@@ -65,6 +67,7 @@ impl CodecId {
     pub fn name(self) -> &'static str {
         match self {
             CodecId::PcmU8 => "pcm_u8",
+            CodecId::PcmS8 => "pcm_s8",
             CodecId::PcmS16Le => "pcm_s16le",
             CodecId::PcmS16Be => "pcm_s16be",
             CodecId::PcmS24Le => "pcm_s24le",
@@ -86,6 +89,7 @@ impl CodecId {
     pub fn long_name(self) -> &'static str {
         match self {
             CodecId::PcmU8 => "PCM unsigned 8-bit",
+            CodecId::PcmS8 => "PCM signed 8-bit",
             CodecId::PcmS16Le => "PCM signed 16-bit little-endian",
             CodecId::PcmS16Be => "PCM signed 16-bit big-endian",
             CodecId::PcmS24Le => "PCM signed 24-bit little-endian",
@@ -121,7 +125,7 @@ impl CodecId {
     /// Bits per sample of a PCM codec, `None` for anything else.
     pub fn pcm_bits(self) -> Option<u32> {
         Some(match self {
-            CodecId::PcmU8 | CodecId::PcmAlaw | CodecId::PcmMulaw => 8,
+            CodecId::PcmU8 | CodecId::PcmS8 | CodecId::PcmAlaw | CodecId::PcmMulaw => 8,
             CodecId::PcmS16Le | CodecId::PcmS16Be => 16,
             CodecId::PcmS24Le | CodecId::PcmS24Be => 24,
             CodecId::PcmS32Le | CodecId::PcmS32Be | CodecId::PcmF32Le | CodecId::PcmF32Be => 32,

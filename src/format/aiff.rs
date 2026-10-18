@@ -37,7 +37,7 @@ pub const OUTPUT: OutputFormat = OutputFormat {
     audio_codec: Some(CodecId::PcmS16Be),
     video_codec: None,
     codecs: &[
-        CodecId::PcmU8,
+        CodecId::PcmS8,
         CodecId::PcmS16Be,
         CodecId::PcmS24Be,
         CodecId::PcmS32Be,

@@ -48,6 +48,7 @@ pub fn decode_samples(codec: CodecId, bytes: &[u8]) -> Result<AudioData> {
     };
     Ok(match codec {
         CodecId::PcmU8 => ints(|b| b[0] as i32 - 128, 8),
+        CodecId::PcmS8 => ints(|b| b[0] as i8 as i32, 8),
         CodecId::PcmS16Le => ints(|b| i16::from_le_bytes([b[0], b[1]]) as i32, 16),
         CodecId::PcmS16Be => ints(|b| i16::from_be_bytes([b[0], b[1]]) as i32, 16),
         // 24-bit: place the three bytes in the top of an i32, then shift
@@ -98,6 +99,7 @@ pub fn encode_samples(codec: CodecId, data: &AudioData) -> Result<Vec<u8>> {
             for &s in samples {
                 match codec {
                     CodecId::PcmU8 => out.push((s + 128) as u8),
+                    CodecId::PcmS8 => out.push(s as i8 as u8),
                     CodecId::PcmS16Le => out.extend_from_slice(&(s as i16).to_le_bytes()),
                     CodecId::PcmS16Be => out.extend_from_slice(&(s as i16).to_be_bytes()),
                     CodecId::PcmS24Le => out.extend_from_slice(&s.to_le_bytes()[..3]),
@@ -302,6 +304,7 @@ mod tests {
     fn integer_layouts_round_trip() {
         let cases = [
             (CodecId::PcmU8, vec![-128, -1, 0, 127]),
+            (CodecId::PcmS8, vec![-128, -1, 0, 127]),
             (CodecId::PcmS16Le, vec![-32768, -1, 0, 32767]),
             (CodecId::PcmS16Be, vec![-32768, -1, 0, 32767]),
             (CodecId::PcmS24Le, vec![-8388608, -1, 0, 8388607]),
