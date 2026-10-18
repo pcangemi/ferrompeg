@@ -23,9 +23,15 @@
 //! fixed point that always sum to exactly one, so a solid area stays solid
 //! whatever the kernel. The horizontal pass keeps 6 fractional bits for the
 //! vertical pass, so the two passes round only once.
+//!
+//! Every output plane is cut into bands of rows that are computed
+//! independently, all planes of a picture in one batch, so the work spreads
+//! over the CPU cores. A band never depends on another one and the output
+//! is the same for any number of threads.
 
 use crate::error::{Error, Result};
 use crate::frame::{PixelFormat, VideoFrame};
+use crate::util::parallel::{self, Job};
 
 /// Interpolation used when the size changes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -82,12 +88,12 @@ pub fn convert(
     let (w, h) = (width as usize, height as usize);
     let planes = match (family(frame.format), family(format)) {
         (Family::Yuv, Family::Yuv) => {
-            let mut out = vec![src.scale_plane(0, w, h, 1, 1, algorithm)];
             let (sx, sy) = format.chroma_shift();
-            for p in 1..3 {
-                out.push(src.scale_plane(p, w, h, 1 << sx, 1 << sy, algorithm));
-            }
-            out
+            let (cx, cy) = (1 << sx, 1 << sy);
+            src.scale_planes(
+                &[(0, w, h, 1, 1), (1, w, h, cx, cy), (2, w, h, cx, cy)],
+                algorithm,
+            )
         }
         (Family::Yuv, Family::Gray) => {
             let mut y = src.scale_plane(0, w, h, 1, 1, algorithm);
@@ -95,10 +101,11 @@ pub fn convert(
             vec![y]
         }
         (Family::Yuv, Family::Rgb) => {
-            let y = src.scale_plane(0, w, h, 1, 1, algorithm);
-            let u = src.scale_plane(1, w, h, 1, 1, algorithm);
-            let v = src.scale_plane(2, w, h, 1, 1, algorithm);
-            vec![yuv_planes_to_rgb(&y, &u, &v)]
+            let yuv = src.scale_planes(
+                &[(0, w, h, 1, 1), (1, w, h, 1, 1), (2, w, h, 1, 1)],
+                algorithm,
+            );
+            vec![yuv_planes_to_rgb(&yuv[0], &yuv[1], &yuv[2])]
         }
         (Family::Gray, Family::Yuv) => {
             let mut y = src.scale_plane(0, w, h, 1, 1, algorithm);
@@ -122,21 +129,22 @@ pub fn convert(
             // size and subsampling.
             let full = src.map_rgb(rgb_to_yuv);
             let (sx, sy) = format.chroma_shift();
-            vec![
-                full.scale_plane(0, w, h, 1, 1, algorithm),
-                full.scale_plane(1, w, h, 1 << sx, 1 << sy, algorithm),
-                full.scale_plane(2, w, h, 1 << sx, 1 << sy, algorithm),
-            ]
+            let (cx, cy) = (1 << sx, 1 << sy);
+            full.scale_planes(
+                &[(0, w, h, 1, 1), (1, w, h, cx, cy), (2, w, h, cx, cy)],
+                algorithm,
+            )
         }
         (Family::Rgb, Family::Gray) => {
             let gray = src.map_rgb(|c| [rgb_to_gray(c)]);
             vec![gray.scale_plane(0, w, h, 1, 1, algorithm)]
         }
         (Family::Rgb, Family::Rgb) => {
-            let r = src.scale_plane(0, w, h, 1, 1, algorithm);
-            let g = src.scale_plane(1, w, h, 1, 1, algorithm);
-            let b = src.scale_plane(2, w, h, 1, 1, algorithm);
-            vec![pack_rgb(&r, &g, &b)]
+            let rgb = src.scale_planes(
+                &[(0, w, h, 1, 1), (1, w, h, 1, 1), (2, w, h, 1, 1)],
+                algorithm,
+            );
+            vec![pack_rgb(&rgb[0], &rgb[1], &rgb[2])]
         }
     };
     let out = VideoFrame {
@@ -258,14 +266,17 @@ impl Picture {
     fn from_frame(frame: &VideoFrame) -> Self {
         let (width, height) = (frame.width as usize, frame.height as usize);
         let (planes, factors) = if frame.format == PixelFormat::Rgb24 {
-            let mut rgb: Vec<Vec<u8>> =
-                (0..3).map(|_| Vec::with_capacity(width * height)).collect();
-            for px in frame.planes[0].chunks_exact(3) {
-                for (plane, &v) in rgb.iter_mut().zip(px) {
-                    plane.push(v);
-                }
+            let n = width * height;
+            let (mut r, mut g, mut b) = (vec![0u8; n], vec![0u8; n], vec![0u8; n]);
+            for (((px, r), g), b) in frame.planes[0]
+                .chunks_exact(3)
+                .zip(&mut r)
+                .zip(&mut g)
+                .zip(&mut b)
+            {
+                (*r, *g, *b) = (px[0], px[1], px[2]);
             }
-            let planes = rgb
+            let planes = [r, g, b]
                 .into_iter()
                 .map(|data| Plane {
                     width,
@@ -299,25 +310,50 @@ impl Picture {
 
     /// Maps the three planes of an RGB picture through `f`, pixel by
     /// pixel, into `N` full resolution planes.
-    fn map_rgb<const N: usize>(&self, f: impl Fn([u8; 3]) -> [u8; N]) -> Picture {
-        let n = self.width * self.height;
-        let mut planes: Vec<Plane> = (0..N)
-            .map(|_| Plane {
-                width: self.width,
-                height: self.height,
-                data: Vec::with_capacity(n),
-            })
-            .collect();
-        let [r, g, b] = [0, 1, 2].map(|p| &self.planes[p].data);
-        for ((&r, &g), &b) in r.iter().zip(g).zip(b) {
-            for (plane, v) in planes.iter_mut().zip(f([r, g, b])) {
-                plane.data.push(v);
+    fn map_rgb<const N: usize>(&self, f: impl Fn([u8; 3]) -> [u8; N] + Sync) -> Picture {
+        let (width, n) = (self.width, self.width * self.height);
+        let mut out: Vec<Vec<u8>> = (0..N).map(|_| vec![0u8; n]).collect();
+        let band = parallel::rows_per_chunk(self.height, width * 4) * width;
+        // One job per band of rows, each holding its slice of every output.
+        let mut bands: Vec<Vec<&mut [u8]>> = Vec::new();
+        for plane in &mut out {
+            for (i, chunk) in plane.chunks_mut(band).enumerate() {
+                if bands.len() <= i {
+                    bands.push(Vec::with_capacity(N));
+                }
+                bands[i].push(chunk);
             }
         }
+        let [r, g, b] = [0, 1, 2].map(|p| &self.planes[p].data);
+        let f = &f;
+        parallel::run(
+            bands
+                .into_iter()
+                .enumerate()
+                .map(|(i, mut outs)| {
+                    Box::new(move || {
+                        let at = i * band;
+                        for k in 0..outs[0].len() {
+                            let px = f([r[at + k], g[at + k], b[at + k]]);
+                            for (o, v) in outs.iter_mut().zip(px) {
+                                o[k] = v;
+                            }
+                        }
+                    }) as Job
+                })
+                .collect(),
+        );
         Picture {
             width: self.width,
             height: self.height,
-            planes,
+            planes: out
+                .into_iter()
+                .map(|data| Plane {
+                    width: self.width,
+                    height: self.height,
+                    data,
+                })
+                .collect(),
             factors: vec![(1, 1); N],
         }
     }
@@ -333,21 +369,53 @@ impl Picture {
         fy: usize,
         algorithm: ScaleAlgorithm,
     ) -> Plane {
-        let src = &self.planes[p];
-        let (sfx, sfy) = self.factors[p];
-        let x = AxisMap {
-            src_picture: self.width,
-            src_factor: sfx,
-            dst_picture: width,
-            dst_factor: fx,
-        };
-        let y = AxisMap {
-            src_picture: self.height,
-            src_factor: sfy,
-            dst_picture: height,
-            dst_factor: fy,
-        };
-        resample(src, x, y, algorithm)
+        self.scale_planes(&[(p, width, height, fx, fy)], algorithm)
+            .pop()
+            .expect("one plane requested")
+    }
+
+    /// Resamples several planes in one parallel batch. Each request is
+    /// `(plane, width, height, fx, fy)` as for [`Picture::scale_plane`].
+    fn scale_planes(
+        &self,
+        requests: &[(usize, usize, usize, usize, usize)],
+        algorithm: ScaleAlgorithm,
+    ) -> Vec<Plane> {
+        let resizes: Vec<Resize> = requests
+            .iter()
+            .map(|&(p, width, height, fx, fy)| {
+                let (sfx, sfy) = self.factors[p];
+                let x = AxisMap {
+                    src_picture: self.width,
+                    src_factor: sfx,
+                    dst_picture: width,
+                    dst_factor: fx,
+                };
+                let y = AxisMap {
+                    src_picture: self.height,
+                    src_factor: sfy,
+                    dst_picture: height,
+                    dst_factor: fy,
+                };
+                Resize::new(&self.planes[p], x, y, algorithm)
+            })
+            .collect();
+        let mut outs: Vec<Vec<u8>> = resizes.iter().map(|r| vec![0u8; r.dw * r.dh]).collect();
+        let jobs = resizes
+            .iter()
+            .zip(&mut outs)
+            .flat_map(|(r, out)| r.jobs(out))
+            .collect();
+        parallel::run(jobs);
+        resizes
+            .iter()
+            .zip(outs)
+            .map(|(r, data)| Plane {
+                width: r.dw,
+                height: r.dh,
+                data,
+            })
+            .collect()
     }
 }
 
@@ -530,91 +598,157 @@ fn quantize(raw: &[(isize, f64)], last: isize, center: f64) -> (usize, Vec<i32>)
     (lo + first, q[first..end].to_vec())
 }
 
-fn resample(src: &Plane, x: AxisMap, y: AxisMap, algorithm: ScaleAlgorithm) -> Plane {
-    let (dw, dh) = (x.dst_len(), y.dst_len());
-    let data = match (x.filter(algorithm), y.filter(algorithm)) {
-        (None, None) => src.data.clone(),
-        (Some(fx), None) => horizontal_u8(&src.data, src.width, &fx, dw),
-        (None, Some(fy)) => vertical(&src.data, src.width, 0, &fy, dh),
-        (Some(fx), Some(fy)) => {
-            let mid = horizontal_mid(&src.data, src.width, &fx, dw);
-            vertical(&mid, dw, MID_BITS, &fy, dh)
+/// One plane to resample: its source, the filter of each axis (`None`
+/// when that axis keeps its size) and the output size.
+struct Resize<'a> {
+    src: &'a Plane,
+    fx: Option<AxisFilter>,
+    fy: Option<AxisFilter>,
+    dw: usize,
+    dh: usize,
+}
+
+impl<'a> Resize<'a> {
+    fn new(src: &'a Plane, x: AxisMap, y: AxisMap, algorithm: ScaleAlgorithm) -> Self {
+        Resize {
+            src,
+            fx: x.filter(algorithm),
+            fy: y.filter(algorithm),
+            dw: x.dst_len(),
+            dh: y.dst_len(),
         }
-    };
-    Plane {
-        width: dw,
-        height: dh,
-        data,
+    }
+
+    /// Splits the work into bands of output rows written to `out`.
+    fn jobs<'b>(&'b self, out: &'b mut [u8]) -> Vec<Job<'b>> {
+        let taps = |f: &Option<AxisFilter>| f.as_ref().map_or(1, |f| f.taps);
+        let cost = self.dw * (taps(&self.fx) + taps(&self.fy));
+        let rows = parallel::rows_per_chunk(self.dh, cost);
+        out.chunks_mut((rows * self.dw).max(1))
+            .enumerate()
+            .map(|(i, band)| Box::new(move || self.band(i * rows, band)) as Job)
+            .collect()
+    }
+
+    /// Computes output rows `y0..` into `out`, which holds whole rows.
+    fn band(&self, y0: usize, out: &mut [u8]) {
+        let rows = out.len() / self.dw;
+        let sw = self.src.width;
+        let src = &self.src.data;
+        match (&self.fx, &self.fy) {
+            (None, None) => out.copy_from_slice(&src[y0 * sw..(y0 + rows) * sw]),
+            (Some(fx), None) => horizontal_u8(&src[y0 * sw..(y0 + rows) * sw], sw, fx, out),
+            (None, Some(fy)) => vertical(src, sw, 0, fy, y0, 0, out),
+            (Some(fx), Some(fy)) => {
+                // Only the source rows under this band go through the
+                // horizontal pass.
+                let starts = &fy.starts[y0..y0 + rows];
+                let first = starts.iter().copied().min().unwrap_or(0);
+                let end = starts.iter().copied().max().unwrap_or(0) + fy.taps;
+                let mut mid = vec![0i16; (end - first) * self.dw];
+                horizontal_mid(&src[first * sw..end * sw], sw, fx, &mut mid);
+                vertical(&mid, self.dw, MID_BITS, fy, y0, first, out);
+            }
+        }
     }
 }
 
 /// Horizontal pass producing samples with `MID_BITS` fractional bits.
-fn horizontal_mid(src: &[u8], width: usize, f: &AxisFilter, dw: usize) -> Vec<i16> {
+fn horizontal_mid(src: &[u8], width: usize, f: &AxisFilter, out: &mut [i16]) {
     let shift = WEIGHT_BITS - MID_BITS;
     let round = 1 << (shift - 1);
-    let mut out = vec![0i16; dw * (src.len() / width)];
+    let dw = f.starts.len();
+    let mut acc = vec![0i32; dw];
     for (row, out_row) in src.chunks_exact(width).zip(out.chunks_exact_mut(dw)) {
-        for ((o, &start), w) in out_row
-            .iter_mut()
-            .zip(&f.starts)
-            .zip(f.weights.chunks_exact(f.taps))
-        {
-            let acc = dot(&row[start..start + f.taps], w);
+        filter_row(row, f, &mut acc);
+        for (o, &a) in out_row.iter_mut().zip(&acc) {
             // Cubic overshoot stays far inside the i16 range.
-            *o = ((acc + round) >> shift).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            *o = ((a + round) >> shift).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
         }
     }
-    out
 }
 
 /// Horizontal pass producing final 8-bit samples.
-fn horizontal_u8(src: &[u8], width: usize, f: &AxisFilter, dw: usize) -> Vec<u8> {
+fn horizontal_u8(src: &[u8], width: usize, f: &AxisFilter, out: &mut [u8]) {
     let round = 1 << (WEIGHT_BITS - 1);
-    let mut out = vec![0u8; dw * (src.len() / width)];
+    let dw = f.starts.len();
+    let mut acc = vec![0i32; dw];
     for (row, out_row) in src.chunks_exact(width).zip(out.chunks_exact_mut(dw)) {
-        for ((o, &start), w) in out_row
-            .iter_mut()
-            .zip(&f.starts)
-            .zip(f.weights.chunks_exact(f.taps))
-        {
-            *o = clamp_u8((dot(&row[start..start + f.taps], w) + round) >> WEIGHT_BITS);
+        filter_row(row, f, &mut acc);
+        for (o, &a) in out_row.iter_mut().zip(&acc) {
+            *o = clamp_u8((a + round) >> WEIGHT_BITS);
         }
     }
-    out
 }
 
-fn dot(samples: &[u8], weights: &[i32]) -> i32 {
-    samples
-        .iter()
-        .zip(weights)
-        .map(|(&s, &w)| s as i32 * w)
-        .sum()
+/// Filters one source row into fixed point output samples. Common tap
+/// counts get a version with the count known at compile time, which the
+/// compiler unrolls; the arithmetic is the same.
+fn filter_row(row: &[u8], f: &AxisFilter, acc: &mut [i32]) {
+    match f.taps {
+        1 => filter_row_n::<1>(row, f, acc),
+        2 => filter_row_n::<2>(row, f, acc),
+        3 => filter_row_n::<3>(row, f, acc),
+        4 => filter_row_n::<4>(row, f, acc),
+        5 => filter_row_n::<5>(row, f, acc),
+        6 => filter_row_n::<6>(row, f, acc),
+        7 => filter_row_n::<7>(row, f, acc),
+        8 => filter_row_n::<8>(row, f, acc),
+        taps => {
+            for ((a, &start), w) in acc
+                .iter_mut()
+                .zip(&f.starts)
+                .zip(f.weights.chunks_exact(taps))
+            {
+                *a = row[start..start + taps]
+                    .iter()
+                    .zip(w)
+                    .map(|(&s, &w)| s as i32 * w)
+                    .sum();
+            }
+        }
+    }
+}
+
+fn filter_row_n<const N: usize>(row: &[u8], f: &AxisFilter, acc: &mut [i32]) {
+    for ((a, &start), w) in acc.iter_mut().zip(&f.starts).zip(f.weights.chunks_exact(N)) {
+        let s: &[u8; N] = row[start..start + N].try_into().expect("N samples");
+        let w: &[i32; N] = w.try_into().expect("N weights");
+        let mut sum = 0;
+        for k in 0..N {
+            sum += s[k] as i32 * w[k];
+        }
+        *a = sum;
+    }
 }
 
 /// Vertical pass over samples carrying `frac_bits` fractional bits,
-/// producing final 8-bit samples. Rows are accumulated whole so the inner
-/// loop runs along contiguous memory.
+/// producing output rows `y0..` as final 8-bit samples. `src` starts at
+/// source row `src_row0`. Rows are accumulated whole so the inner loop
+/// runs along contiguous memory.
 fn vertical<T: Copy + Into<i32>>(
     src: &[T],
     width: usize,
     frac_bits: u32,
     f: &AxisFilter,
-    dh: usize,
-) -> Vec<u8> {
+    y0: usize,
+    src_row0: usize,
+    out: &mut [u8],
+) {
     let shift = WEIGHT_BITS + frac_bits;
-    let mut out = vec![0u8; width * dh];
     let mut acc = vec![0i32; width];
     for ((out_row, &start), w) in out
         .chunks_exact_mut(width)
-        .zip(&f.starts)
-        .zip(f.weights.chunks_exact(f.taps))
+        .zip(&f.starts[y0..])
+        .zip(f.weights[y0 * f.taps..].chunks_exact(f.taps))
     {
         acc.fill(1 << (shift - 1));
         for (k, &wk) in w.iter().enumerate() {
             if wk == 0 {
                 continue;
             }
-            let row = &src[(start + k) * width..(start + k + 1) * width];
+            let r = start - src_row0 + k;
+            let row = &src[r * width..(r + 1) * width];
             for (a, &s) in acc.iter_mut().zip(row) {
                 *a += wk * s.into();
             }
@@ -623,16 +757,20 @@ fn vertical<T: Copy + Into<i32>>(
             *o = clamp_u8(a >> shift);
         }
     }
-    out
 }
 
 fn pack_rgb(r: &Plane, g: &Plane, b: &Plane) -> Plane {
-    let mut data = Vec::with_capacity(r.data.len() * 3);
-    for ((&r, &g), &b) in r.data.iter().zip(&g.data).zip(&b.data) {
-        data.extend_from_slice(&[r, g, b]);
-    }
+    let width = r.width;
+    let mut data = vec![0u8; r.data.len() * 3];
+    let rows = parallel::rows_per_chunk(r.height, width * 3);
+    parallel::for_each_chunk(&mut data, rows * width * 3, |i, out| {
+        let at = i * rows * width;
+        for (k, px) in out.chunks_exact_mut(3).enumerate() {
+            px.copy_from_slice(&[r.data[at + k], g.data[at + k], b.data[at + k]]);
+        }
+    });
     Plane {
-        width: r.width * 3,
+        width: width * 3,
         height: r.height,
         data,
     }
@@ -640,17 +778,21 @@ fn pack_rgb(r: &Plane, g: &Plane, b: &Plane) -> Plane {
 
 /// Full resolution Y, Cb, Cr planes to packed RGB.
 fn yuv_planes_to_rgb(y: &Plane, u: &Plane, v: &Plane) -> Plane {
+    let width = y.width;
     let mut data = vec![0u8; y.data.len() * 3];
-    for (((out, &y), &u), &v) in data
-        .chunks_exact_mut(3)
-        .zip(&y.data)
-        .zip(&u.data)
-        .zip(&v.data)
-    {
-        out.copy_from_slice(&yuv_to_rgb([y, u, v]));
-    }
+    let rows = parallel::rows_per_chunk(y.height, width * 8);
+    parallel::for_each_chunk(&mut data, rows * width * 3, |i, out| {
+        let at = i * rows * width;
+        for (k, px) in out.chunks_exact_mut(3).enumerate() {
+            px.copy_from_slice(&yuv_to_rgb([
+                y.data[at + k],
+                u.data[at + k],
+                v.data[at + k],
+            ]));
+        }
+    });
     Plane {
-        width: y.width * 3,
+        width: width * 3,
         height: y.height,
         data,
     }

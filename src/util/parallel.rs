@@ -26,30 +26,25 @@ pub fn threads() -> usize {
     }
 }
 
-/// Splits `data` into chunks of `chunk_len` items and calls
-/// `f(chunk_index, chunk)` for each, on several threads when there is more
-/// than one chunk. Chunk `i` starts at item `i * chunk_len`.
-pub fn for_each_chunk<T, F>(data: &mut [T], chunk_len: usize, f: F)
-where
-    T: Send,
-    F: Fn(usize, &mut [T]) + Sync,
-{
-    let chunk_len = chunk_len.max(1);
-    let workers = threads().min(data.len().div_ceil(chunk_len));
+/// A piece of work that may borrow from the caller.
+pub type Job<'a> = Box<dyn FnOnce() + Send + 'a>;
+
+/// Runs every job, on several threads when there is more than one, and
+/// returns once all are done.
+pub fn run(jobs: Vec<Job<'_>>) {
+    let workers = threads().min(jobs.len());
     if workers <= 1 {
-        for (i, chunk) in data.chunks_mut(chunk_len).enumerate() {
-            f(i, chunk);
-        }
+        jobs.into_iter().for_each(|job| job());
         return;
     }
-    let queue = Mutex::new(data.chunks_mut(chunk_len).enumerate());
+    let queue = Mutex::new(jobs.into_iter());
     let work = || {
         loop {
-            // A panic in `f` poisons nothing that matters here: the
+            // A panicking job poisons nothing that matters here: the
             // iterator is still valid and the scope re-raises the panic.
             let next = queue.lock().unwrap_or_else(|e| e.into_inner()).next();
             match next {
-                Some((i, chunk)) => f(i, chunk),
+                Some(job) => job(),
                 None => break,
             }
         }
@@ -60,6 +55,22 @@ where
         }
         work();
     });
+}
+
+/// Splits `data` into chunks of `chunk_len` items and calls
+/// `f(chunk_index, chunk)` for each, on several threads when there is more
+/// than one chunk. Chunk `i` starts at item `i * chunk_len`.
+pub fn for_each_chunk<T, F>(data: &mut [T], chunk_len: usize, f: F)
+where
+    T: Send,
+    F: Fn(usize, &mut [T]) + Sync,
+{
+    let f = &f;
+    run(data
+        .chunks_mut(chunk_len.max(1))
+        .enumerate()
+        .map(|(i, chunk)| Box::new(move || f(i, chunk)) as Job)
+        .collect());
 }
 
 /// Applies `f` to every item, in parallel, keeping the order.
