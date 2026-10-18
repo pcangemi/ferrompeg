@@ -90,19 +90,41 @@ impl Md5 {
             *word = u32::from_le_bytes(block[i * 4..i * 4 + 4].try_into().unwrap());
         }
         let [mut a, mut b, mut c, mut d] = self.state;
-        for i in 0..64 {
-            let (f, g) = match i / 16 {
-                0 => ((b & c) | (!b & d), i),
-                1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
-                2 => (b ^ c ^ d, (3 * i + 5) % 16),
-                _ => (c ^ (b | !d), (7 * i) % 16),
+        // The 64 steps written out, so every message index, constant and
+        // rotation is known at compile time.
+        macro_rules! step {
+            ($f:expr, $a:ident, $b:ident, $i:expr, $g:expr) => {
+                $a = $b.wrapping_add(
+                    $a.wrapping_add($f)
+                        .wrapping_add(K[$i])
+                        .wrapping_add(m[$g])
+                        .rotate_left(S[$i]),
+                );
             };
-            let rotated = a
-                .wrapping_add(f)
-                .wrapping_add(K[i])
-                .wrapping_add(m[g])
-                .rotate_left(S[i]);
-            (a, b, c, d) = (d, b.wrapping_add(rotated), b, c);
+        }
+        macro_rules! round {
+            ($i:expr, $f:expr, $g:expr) => {
+                step!($f(b, c, d), a, b, $i, $g($i));
+                step!($f(a, b, c), d, a, $i + 1, $g($i + 1));
+                step!($f(d, a, b), c, d, $i + 2, $g($i + 2));
+                step!($f(c, d, a), b, c, $i + 3, $g($i + 3));
+            };
+        }
+        let f = |b: u32, c: u32, d: u32| (b & c) | (!b & d);
+        let g = |b: u32, c: u32, d: u32| (d & b) | (!d & c);
+        let h = |b: u32, c: u32, d: u32| b ^ c ^ d;
+        let i = |b: u32, c: u32, d: u32| c ^ (b | !d);
+        for r in [0, 4, 8, 12] {
+            round!(r, f, |i: usize| i);
+        }
+        for r in [16, 20, 24, 28] {
+            round!(r, g, |i: usize| (5 * i + 1) % 16);
+        }
+        for r in [32, 36, 40, 44] {
+            round!(r, h, |i: usize| (3 * i + 5) % 16);
+        }
+        for r in [48, 52, 56, 60] {
+            round!(r, i, |i: usize| (7 * i) % 16);
         }
         self.state[0] = self.state[0].wrapping_add(a);
         self.state[1] = self.state[1].wrapping_add(b);
