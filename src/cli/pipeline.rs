@@ -564,7 +564,19 @@ pub fn describe_input(index: usize, path: &str, input: &Input) {
         }
     }
     let duration = input.duration().map_or("N/A".to_string(), format_duration);
-    let bitrate: Option<u64> = input.streams.iter().map(|s| s.bit_rate).sum();
+    // Compressed streams rarely declare a bit rate; the file size over the
+    // duration gives the overall rate, as players show it.
+    let file_rate = || {
+        let size = std::fs::metadata(path).ok()?.len();
+        let secs = input.duration().filter(|d| *d > 0.0)?;
+        Some((size as f64 * 8.0 / secs) as u64)
+    };
+    let bitrate = input
+        .streams
+        .iter()
+        .map(|s| s.bit_rate)
+        .sum::<Option<u64>>()
+        .or_else(file_rate);
     let bitrate = bitrate.map_or("N/A".to_string(), |b| format!("{} kb/s", (b + 500) / 1000));
     log::info(format!("  Duration: {duration}, bitrate: {bitrate}"));
     for s in &input.streams {
