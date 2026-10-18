@@ -46,6 +46,26 @@ out of the filter chain, so `-vf scale=...` or `-af aresample=...` decide
 the output parameters without any negotiation step. A muxer writes its
 header once every encoder of its output is ready.
 
+## Parallelism
+
+`util/parallel.rs` spreads independent work over the cores with scoped
+threads from the standard library, no thread pool and no `unsafe`. Work is
+cut into more chunks than there are threads and each thread takes the next
+free chunk, which keeps fast cores busy on processors that mix fast and
+efficient ones. Each chunk writes only its own part of the output, so
+results never depend on the thread count (`-threads N`, one per core by
+default); `tests/cli.rs` checks this end to end.
+
+| Where | Unit of work |
+| --- | --- |
+| `convert/video.rs` | Bands of output rows, all planes of a picture in one batch |
+| `codec/flac/encoder.rs` | Batches of 32 blocks, coded in parallel and written in order |
+| `codec/flac/decoder.rs` | Batches of 32 frames; the MD5 signature is still checked in order |
+| `codec/gif.rs` | Batches of pictures: each depends only on the source pixels of the previous one and on the first picture's color table |
+
+Starting a set of threads costs about 70 microseconds, so batches are sized
+to keep that small next to the work they carry.
+
 ## Registries
 
 - `format/mod.rs` lists every `InputFormat` (with a content probe) and
