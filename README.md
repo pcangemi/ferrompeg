@@ -114,18 +114,69 @@ that output, and several outputs can be written in one run.
 
 ## Performance
 
-Correct first, fast enough second. On an Apple Silicon laptop, for two minutes
-of 16-bit stereo audio:
+Correct first, fast enough second. Short version: FFmpeg is faster at almost
+everything that involves real computation, by 4 to 8 times on codecs, scaling
+and GIF, and by about 20 times on resampling and `atempo`. ferrompeg is only
+level or ahead on tasks that do almost nothing besides reading and writing,
+because it starts in under 3 ms where `ffmpeg` needs 28 ms to load its shared
+libraries.
 
-| | ferrompeg | reference `flac -5` |
-| --- | --- | --- |
-| FLAC encode | 1.06 s | 0.20 s |
-| FLAC decode | 0.21 s | 0.13 s |
-| Output size | 7,134,512 bytes | 7,134,013 bytes |
+### Timing against FFmpeg
 
-Compression matches the reference encoder within 0.01%, while encoding is
-about five times slower. Mature media tools owe most of their speed to
-hand-tuned SIMD code; ferrompeg has none yet, which leaves room to improve.
+Same commands on both tools, for every task both can do. Apple M1 (8 cores),
+macOS 26.6, ferrompeg 0.1.0 release build, FFmpeg 9.0.2 from Homebrew. Median
+wall time of 10 runs after one warm-up run, including process start, reading
+the input and writing the output to the SSD. Inputs: two minutes of 44.1 kHz
+16-bit stereo audio (21 MB WAV) and ten seconds of 1280x720 yuv420p video at
+25 fps (346 MB `.y4m`).
+
+| Task | ferrompeg | ffmpeg | ffmpeg, 1 thread | ferrompeg vs ffmpeg |
+| --- | ---: | ---: | ---: | --- |
+| WAV to FLAC | 1.378 s | 0.255 s | 0.252 s | 5.4x slower |
+| FLAC to WAV | 0.266 s | 0.063 s | 0.146 s | 4.2x slower |
+| WAV to 24-bit AIFF | 0.035 s | 0.076 s | 0.072 s | 2.2x faster |
+| highpass, volume, afade | 0.089 s | 0.104 s | 0.086 s | 1.2x faster |
+| FLAC stream copy | 0.034 s | 0.035 s | 0.035 s | same |
+| Resample 44.1 to 48 kHz | 3.153 s | 0.135 s | 0.129 s | 23.4x slower |
+| atempo=1.25 | 3.529 s | 0.177 s | 0.176 s | 19.9x slower |
+| Scale 720p to 360p, bilinear | 0.489 s | 0.080 s | 0.109 s | 6.1x slower |
+| Scale 720p to 540p, bicubic | 0.922 s | 0.142 s | 0.256 s | 6.5x slower |
+| yuv420p to yuv444p | 0.838 s | 0.714 s | 0.673 s | 1.2x slower |
+| crop and hflip | 0.075 s | 0.066 s | 0.065 s | 1.1x slower |
+| 720p to 320x180 GIF at 12 fps | 1.033 s | 0.135 s | 0.244 s | 7.7x slower |
+| testsrc, 10 s of 720p | 1.604 s | 0.394 s | 0.375 s | 4.1x slower |
+
+How to read it:
+
+- ferrompeg runs on a single thread. The "1 thread" column passes
+  `-threads 1 -filter_threads 1` to FFmpeg, which still keeps reading,
+  decoding, filtering and writing in separate threads, so it is the closest
+  comparison available, not an exact one.
+- The tasks where ferrompeg is level or faster are dominated by process start
+  and disk access. The conversion to yuv444p writes 690 MB and its ratio moved
+  between 1.2x and 2.2x from one run of the benchmark to the next.
+- The resampler and `atempo` are the slowest parts and the first targets for
+  optimization. FFmpeg owes much of its lead elsewhere to years of tuning and
+  hand-written SIMD code; ferrompeg has no SIMD yet.
+
+### Are the outputs the same?
+
+Speed only means something if the results match, so every output above was
+compared with FFmpeg's:
+
+| Task | Result |
+| --- | --- |
+| WAV to FLAC | Lossless (decoded samples identical to the source, `flac -t` passes); 8,414,038 bytes against 8,477,065 for FFmpeg, 0.7% smaller |
+| FLAC to WAV | Bit-identical samples |
+| Bilinear scale, crop and hflip | Bit-identical to FFmpeg |
+| Bicubic scale | 56.6 dB PSNR against FFmpeg's output, visually identical |
+| Resample to 48 kHz | 55.9 dB SNR against FFmpeg's output |
+| highpass, volume, afade | 78.8 dB SNR against FFmpeg's output |
+| atempo | Different algorithm; same length within 5 ms, not comparable sample by sample |
+| GIF | Different strategies: ferrompeg builds one palette per frame (2.6 MB, 21.0 dB PSNR against the source), FFmpeg by default uses one fixed palette (1.4 MB, 20.7 dB). FFmpeg's best quality mode, `palettegen` with `paletteuse`, gives 4.6 MB and 21.7 dB in 0.55 s |
+
+Run `python3 bench/compare.py` to reproduce the timings on your machine
+(needs `ffmpeg` on the `PATH`).
 
 ## Limitations
 
