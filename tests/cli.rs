@@ -128,3 +128,61 @@ fn stream_copy_preserves_bytes() {
     run(&["-i", a.to_str().unwrap(), "-c", "copy", b.to_str().unwrap()]);
     assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
 }
+
+#[test]
+fn output_does_not_depend_on_the_thread_count() {
+    let dir = scratch("threads");
+    let p = |name: &str| dir.join(name).to_str().unwrap().to_string();
+    // Long enough for several FLAC and GIF batches and many picture bands.
+    run(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "anoisesrc=d=8:c=pink:a=0.5",
+        "-ac",
+        "2",
+        &p("in.wav"),
+    ]);
+    run(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=s=640x360:r=25:d=3",
+        &p("in.y4m"),
+    ]);
+    let cases: [(&str, &[&str], &str); 5] = [
+        ("in.wav", &[], "flac"),
+        ("in.wav", &["-ar", "48000", "-af", "atempo=1.3"], "wav"),
+        ("in.y4m", &["-vf", "scale=500:-2:flags=bicubic"], "y4m"),
+        ("in.y4m", &["-pix_fmt", "rgb24", "-f", "rawvideo"], "rgb"),
+        ("in.y4m", &["-vf", "scale=320:-2,fps=10"], "gif"),
+    ];
+    for (i, (input, opts, ext)) in cases.iter().enumerate() {
+        let mut outputs = Vec::new();
+        for threads in ["1", "3", "8"] {
+            let out = p(&format!("{i}-{threads}.{ext}"));
+            let mut args = vec!["-threads", threads, "-i"];
+            let input = p(input);
+            args.push(&input);
+            args.extend_from_slice(opts);
+            args.push(&out);
+            run(&args);
+            outputs.push(std::fs::read(&out).unwrap());
+        }
+        assert!(
+            outputs.windows(2).all(|w| w[0] == w[1]),
+            "case {i} ({ext}) differs between thread counts"
+        );
+    }
+    // Decoding the FLAC is batched too.
+    run(&["-threads", "1", "-i", &p("0-1.flac"), &p("d1.wav")]);
+    run(&["-threads", "8", "-i", &p("0-1.flac"), &p("d8.wav")]);
+    assert_eq!(
+        wav_samples(&dir.join("d1.wav")),
+        wav_samples(&dir.join("in.wav"))
+    );
+    assert_eq!(
+        wav_samples(&dir.join("d8.wav")),
+        wav_samples(&dir.join("in.wav"))
+    );
+}
