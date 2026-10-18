@@ -11,3 +11,4 @@
 *.pgm
 *.bmp
 !tests/fixtures/**
+.DS_Store
