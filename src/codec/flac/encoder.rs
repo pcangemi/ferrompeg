@@ -26,9 +26,13 @@ use crate::stream::{AudioParams, CodecId, Packet, StreamInfo, StreamParams};
 use crate::util::bits::BitWriter;
 use crate::util::crc;
 use crate::util::md5::Md5;
+use crate::util::parallel;
 
 /// Default compression level, a good balance of speed and size.
 const DEFAULT_LEVEL: u32 = 5;
+
+/// Full blocks collected before coding them together on several threads.
+const BATCH_BLOCKS: usize = 32;
 
 /// Highest sample rate the 20-bit STREAMINFO field can hold.
 const MAX_SAMPLE_RATE: u32 = (1 << 20) - 1;
@@ -303,17 +307,35 @@ impl FlacEncoder {
         }
     }
 
-    fn emit(&mut self, len: usize) -> Result<Packet> {
-        if self.frame_number > MAX_FRAME_NUMBER {
+    /// Codes `count` blocks of `len` samples from the pending input, in
+    /// parallel, and returns their packets in order.
+    fn emit(&mut self, count: usize, len: usize) -> Result<Vec<Packet>> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        if self.frame_number + count as u64 - 1 > MAX_FRAME_NUMBER {
             return Err(Error::unsupported(
                 "flac stream too long for fixed block size frame numbers",
             ));
         }
-        let block: Vec<Vec<i64>> = self
-            .pending
-            .iter_mut()
-            .map(|ch| ch.drain(..len).map(i64::from).collect())
+        let blocks: Vec<(u64, Vec<Vec<i64>>)> = (0..count)
+            .map(|b| {
+                let block = self
+                    .pending
+                    .iter()
+                    .map(|ch| {
+                        ch[b * len..(b + 1) * len]
+                            .iter()
+                            .map(|&s| s as i64)
+                            .collect()
+                    })
+                    .collect();
+                (self.frame_number + b as u64, block)
+            })
             .collect();
+        for ch in &mut self.pending {
+            ch.drain(..count * len);
+        }
         let windows = if len == self.settings.block_size {
             None
         } else {
@@ -331,19 +353,25 @@ impl FlacEncoder {
             settings: &self.settings,
             windows: windows.as_deref().unwrap_or(&self.windows),
         };
-        let data = encode_frame(&ctx, &block, self.frame_number);
-        let size = data.len() as u32;
-        self.min_frame_size = if self.frame_number == 0 {
-            size
-        } else {
-            self.min_frame_size.min(size)
-        };
-        self.max_frame_size = self.max_frame_size.max(size);
-        self.bytes_out += data.len() as u64;
-        let pts = self.first_pts.unwrap_or(0) + self.samples_coded as i64;
-        self.frame_number += 1;
-        self.samples_coded += len as u64;
-        Ok(Packet::new(self.stream_index, data, pts, len as i64))
+        let frames = parallel::map(&blocks, |(number, block)| {
+            encode_frame(&ctx, block, *number)
+        });
+        let mut packets = Vec::with_capacity(count);
+        for data in frames {
+            let size = data.len() as u32;
+            self.min_frame_size = if self.frame_number == 0 {
+                size
+            } else {
+                self.min_frame_size.min(size)
+            };
+            self.max_frame_size = self.max_frame_size.max(size);
+            self.bytes_out += data.len() as u64;
+            let pts = self.first_pts.unwrap_or(0) + self.samples_coded as i64;
+            self.frame_number += 1;
+            self.samples_coded += len as u64;
+            packets.push(Packet::new(self.stream_index, data, pts, len as i64));
+        }
+        Ok(packets)
     }
 }
 
@@ -397,22 +425,23 @@ impl Encoder for FlacEncoder {
         for (i, &s) in samples.iter().enumerate() {
             self.pending[i % channels].push(s);
         }
-        let mut packets = Vec::new();
-        while self.pending[0].len() >= self.settings.block_size {
-            packets.push(self.emit(self.settings.block_size)?);
+        // Blocks wait until a whole batch is ready so the batch can be
+        // spread over the cores; the output does not depend on it.
+        let block = self.settings.block_size;
+        if self.pending[0].len() >= BATCH_BLOCKS * block {
+            return self.emit(self.pending[0].len() / block, block);
         }
-        Ok(packets)
+        Ok(Vec::new())
     }
 
     fn flush(&mut self) -> Result<Vec<Packet>> {
         if self.digest.is_some() {
             return Ok(Vec::new());
         }
-        let mut packets = Vec::new();
+        let block = self.settings.block_size;
+        let mut packets = self.emit(self.pending[0].len() / block, block)?;
         let left = self.pending[0].len();
-        if left > 0 {
-            packets.push(self.emit(left)?);
-        }
+        packets.extend(self.emit(usize::from(left > 0), left)?);
         self.digest = self.md5.take().map(Md5::finalize);
         Ok(packets)
     }
@@ -1735,8 +1764,10 @@ mod tests {
             },
             1000,
         );
+        // Two full blocks are fewer than a batch: they wait for more input
+        // or for the flush.
         let mut packets = enc.encode(&Frame::Audio(frame)).unwrap();
-        assert_eq!(packets.len(), 2);
+        assert!(packets.is_empty());
         assert_eq!(
             StreamInfoBlock::parse(&enc.stream_info().extradata).unwrap(),
             si
@@ -1766,6 +1797,28 @@ mod tests {
         assert_eq!(after.duration, Some(10_000));
         assert_eq!(after.codec, CodecId::Flac);
         assert!(after.bit_rate.is_some());
+    }
+
+    #[test]
+    fn full_batches_come_out_without_waiting_for_flush() {
+        let n = (BATCH_BLOCKS + 1) * 4096 + 100;
+        let samples = test_signal(n, 1, 16, 7);
+        let mut enc = new_encoder(CodecId::Flac, &format(1, 16, 44100), &options(5)).unwrap();
+        let frame = AudioFrame::new(44100, 1, AudioData::Int { samples, bits: 16 }, 0);
+        let packets = enc.encode(&Frame::Audio(frame)).unwrap();
+        assert_eq!(packets.len(), BATCH_BLOCKS + 1);
+        assert!(
+            packets
+                .iter()
+                .enumerate()
+                .all(|(i, p)| p.pts == i as i64 * 4096 && p.duration == 4096)
+        );
+        let rest = enc.flush().unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(
+            (rest[0].pts, rest[0].duration),
+            ((BATCH_BLOCKS as i64 + 1) * 4096, 100)
+        );
     }
 
     #[test]
