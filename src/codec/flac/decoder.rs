@@ -17,6 +17,7 @@ use crate::stream::{CodecId, Packet, StreamInfo};
 use crate::util::bits::BitReader;
 use crate::util::crc;
 use crate::util::md5::Md5;
+use crate::util::parallel;
 
 /// Highest LPC order (6-bit subframe type with order minus one in 5 bits).
 const MAX_LPC_ORDER: usize = 32;
@@ -227,12 +228,16 @@ fn read_coded_number(r: &mut BitReader) -> Result<u64> {
     Ok(value)
 }
 
+/// Frames collected before decoding them together on several threads.
+const BATCH_FRAMES: usize = 32;
+
 struct FlacDecoder {
-    info: StreamInfoBlock,
-    channels: usize,
-    bits: u32,
-    /// One reconstruction buffer per channel, reused across frames.
-    buffers: Vec<Vec<i64>>,
+    params: Params,
+    /// Packets waiting to be decoded in one batch: data and timestamp.
+    queue: Vec<(Vec<u8>, i64)>,
+    /// An error met in the middle of a batch, reported on the next call
+    /// once the frames before it have been returned.
+    error: Option<Error>,
     md5: Md5,
     md5_scratch: Vec<u8>,
     /// Samples per channel decoded so far.
@@ -240,13 +245,23 @@ struct FlacDecoder {
     flushed: bool,
 }
 
+/// Stream parameters every frame is checked against.
+struct Params {
+    info: StreamInfoBlock,
+    channels: usize,
+    bits: u32,
+}
+
 impl FlacDecoder {
     fn new(info: StreamInfoBlock) -> Self {
         FlacDecoder {
-            channels: info.channels as usize,
-            bits: info.bits_per_sample as u32,
-            buffers: vec![Vec::new(); info.channels as usize],
-            info,
+            params: Params {
+                channels: info.channels as usize,
+                bits: info.bits_per_sample as u32,
+                info,
+            },
+            queue: Vec::new(),
+            error: None,
             md5: Md5::new(),
             md5_scratch: Vec::new(),
             decoded: 0,
@@ -254,7 +269,50 @@ impl FlacDecoder {
         }
     }
 
-    fn decode_frame(&mut self, data: &[u8], packet_pts: i64) -> Result<AudioFrame> {
+    /// Decodes the queued packets in parallel and returns their frames in
+    /// order, up to the first error, which is kept for the next call.
+    fn decode_queue(&mut self) -> Result<Vec<Frame>> {
+        let queue = std::mem::take(&mut self.queue);
+        let params = &self.params;
+        let results = parallel::map(&queue, |(data, pts)| params.decode_frame(data, *pts));
+        let mut frames = Vec::with_capacity(results.len());
+        for result in results {
+            match result {
+                Ok(frame) => {
+                    if let AudioData::Int { samples, .. } = &frame.data {
+                        self.update_md5(samples);
+                    }
+                    self.decoded += frame.nb_samples() as u64;
+                    frames.push(Frame::Audio(frame));
+                }
+                Err(e) => {
+                    if frames.is_empty() {
+                        return Err(e);
+                    }
+                    self.error = Some(e);
+                    break;
+                }
+            }
+        }
+        Ok(frames)
+    }
+
+    /// Feeds samples to the MD5 in the STREAMINFO layout: interleaved,
+    /// little-endian, each in the fewest whole bytes that hold the depth.
+    fn update_md5(&mut self, samples: &[i32]) {
+        let width = self.params.bits.div_ceil(8) as usize;
+        self.md5_scratch.clear();
+        self.md5_scratch.reserve(samples.len() * width);
+        for &s in samples {
+            self.md5_scratch
+                .extend_from_slice(&s.to_le_bytes()[..width]);
+        }
+        self.md5.update(&self.md5_scratch);
+    }
+}
+
+impl Params {
+    fn decode_frame(&self, data: &[u8], packet_pts: i64) -> Result<AudioFrame> {
         let header = parse_frame_header(data)?;
         if data.len() < header.len + 2 {
             return Err(Error::invalid_data("flac frame is truncated"));
@@ -290,10 +348,9 @@ impl FlacDecoder {
         let block_size = header.block_size as usize;
         let body = &data[header.len..body_end];
         let mut r = BitReader::new(body);
-        for (ch, buf) in self.buffers.iter_mut().enumerate() {
+        let mut buffers = vec![vec![0i64; block_size]; self.channels];
+        for (ch, buf) in buffers.iter_mut().enumerate() {
             let bps = self.bits + header.assignment.is_side(ch) as u32;
-            buf.clear();
-            buf.resize(block_size, 0);
             decode_subframe(&mut r, body, bps, buf)?;
         }
         // Subframes end on a byte boundary padded with zero bits, right
@@ -305,9 +362,7 @@ impl FlacDecoder {
             ));
         }
 
-        let samples = self.interleave(header.assignment, block_size)?;
-        self.update_md5(&samples);
-        self.decoded += block_size as u64;
+        let samples = self.interleave(&buffers, header.assignment, block_size)?;
 
         let pts = if header.variable {
             header.number as i64
@@ -329,7 +384,12 @@ impl FlacDecoder {
 
     /// Undoes inter-channel decorrelation and interleaves the channels,
     /// checking that every sample fits the stream bit depth.
-    fn interleave(&self, assignment: ChannelAssignment, n: usize) -> Result<Vec<i32>> {
+    fn interleave(
+        &self,
+        buffers: &[Vec<i64>],
+        assignment: ChannelAssignment,
+        n: usize,
+    ) -> Result<Vec<i32>> {
         let (lo, hi) = sample_range(self.bits);
         let narrow = |v: i64| -> Result<i32> {
             if v < lo || v > hi {
@@ -343,7 +403,7 @@ impl FlacDecoder {
         match assignment {
             ChannelAssignment::Independent(_) => {
                 for i in 0..n {
-                    for buf in &self.buffers {
+                    for buf in buffers {
                         // Already range checked against the subframe depth,
                         // which equals the stream depth here.
                         out.push(buf[i] as i32);
@@ -351,19 +411,19 @@ impl FlacDecoder {
                 }
             }
             ChannelAssignment::LeftSide => {
-                for (&left, &side) in self.buffers[0].iter().zip(&self.buffers[1]) {
+                for (&left, &side) in buffers[0].iter().zip(&buffers[1]) {
                     out.push(narrow(left)?);
                     out.push(narrow(left - side)?);
                 }
             }
             ChannelAssignment::SideRight => {
-                for (&side, &right) in self.buffers[0].iter().zip(&self.buffers[1]) {
+                for (&side, &right) in buffers[0].iter().zip(&buffers[1]) {
                     out.push(narrow(side + right)?);
                     out.push(narrow(right)?);
                 }
             }
             ChannelAssignment::MidSide => {
-                for (&mid, &side) in self.buffers[0].iter().zip(&self.buffers[1]) {
+                for (&mid, &side) in buffers[0].iter().zip(&buffers[1]) {
                     // The encoder dropped the low bit of left + right; it
                     // equals the low bit of left - right.
                     let sum = (mid << 1) | (side & 1);
@@ -374,46 +434,47 @@ impl FlacDecoder {
         }
         Ok(out)
     }
-
-    /// Feeds samples to the MD5 in the STREAMINFO layout: interleaved,
-    /// little-endian, each in the fewest whole bytes that hold the depth.
-    fn update_md5(&mut self, samples: &[i32]) {
-        let width = self.bits.div_ceil(8) as usize;
-        self.md5_scratch.clear();
-        self.md5_scratch.reserve(samples.len() * width);
-        for &s in samples {
-            self.md5_scratch
-                .extend_from_slice(&s.to_le_bytes()[..width]);
-        }
-        self.md5.update(&self.md5_scratch);
-    }
 }
 
 impl Decoder for FlacDecoder {
     fn decode(&mut self, packet: &Packet) -> Result<Vec<Frame>> {
-        let frame = self.decode_frame(&packet.data, packet.pts)?;
-        Ok(vec![Frame::Audio(frame)])
+        if let Some(e) = self.error.take() {
+            return Err(e);
+        }
+        self.queue.push((packet.data.clone(), packet.pts));
+        if self.queue.len() < BATCH_FRAMES {
+            return Ok(Vec::new());
+        }
+        self.decode_queue()
     }
 
     fn flush(&mut self) -> Result<Vec<Frame>> {
+        if let Some(e) = self.error.take() {
+            return Err(e);
+        }
         if self.flushed {
             return Ok(Vec::new());
+        }
+        let frames = self.decode_queue()?;
+        if self.error.is_some() {
+            // Report the error on the next call, after these frames.
+            return Ok(frames);
         }
         self.flushed = true;
         let digest = std::mem::take(&mut self.md5).finalize();
         // The signature covers the whole stream, so it can only be checked
         // when every declared sample went through this decoder.
-        let declared = self.info.md5 != [0; 16];
+        let declared = self.params.info.md5 != [0; 16];
         if declared
-            && self.info.total_samples > 0
-            && self.decoded == self.info.total_samples
-            && digest != self.info.md5
+            && self.params.info.total_samples > 0
+            && self.decoded == self.params.info.total_samples
+            && digest != self.params.info.md5
         {
             return Err(Error::invalid_data(
                 "flac decoded audio does not match the STREAMINFO MD5 signature",
             ));
         }
-        Ok(Vec::new())
+        Ok(frames)
     }
 }
 
@@ -846,7 +907,8 @@ mod tests {
 
     fn decode_one(info: &StreamInfoBlock, frame: &[u8]) -> Result<AudioFrame> {
         let mut d = new_decoder(&stream_for(info))?;
-        let frames = d.decode(&Packet::new(0, frame.to_vec(), 0, 0))?;
+        let mut frames = d.decode(&Packet::new(0, frame.to_vec(), 0, 0))?;
+        frames.extend(d.flush()?);
         match frames.into_iter().next() {
             Some(Frame::Audio(a)) => Ok(a),
             _ => panic!("expected one audio frame"),
@@ -1449,12 +1511,32 @@ mod tests {
     }
 
     #[test]
+    fn error_in_a_batch_comes_after_the_frames_before_it() {
+        let good = simple_frame();
+        let mut bad = good.clone();
+        let last = bad.len() - 1;
+        bad[last] ^= 1;
+        let mut d = new_decoder(&stream_for(&info(1, 16, 8_000, 4096))).unwrap();
+        assert!(
+            d.decode(&Packet::new(0, good.clone(), 0, 8))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(d.decode(&Packet::new(0, bad, 8, 8)).unwrap().is_empty());
+        d.decode(&Packet::new(0, good, 16, 8)).unwrap();
+        // The first frame decodes, then the corrupt one stops the stream.
+        assert_eq!(d.flush().unwrap().len(), 1);
+        assert!(matches!(d.flush(), Err(Error::InvalidData(m)) if m.contains("CRC")));
+    }
+
+    #[test]
     fn decoder_without_extradata_uses_stream_params() {
         let si = info(1, 16, 8_000, 0);
         let mut stream = stream_for(&si);
         stream.extradata.clear();
         let mut d = new_decoder(&stream).unwrap();
-        let frames = d.decode(&Packet::new(0, simple_frame(), 77, 8)).unwrap();
+        let mut frames = d.decode(&Packet::new(0, simple_frame(), 77, 8)).unwrap();
+        frames.extend(d.flush().unwrap());
         let Frame::Audio(a) = &frames[0] else {
             panic!("expected audio");
         };

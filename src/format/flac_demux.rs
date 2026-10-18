@@ -675,8 +675,16 @@ mod tests {
         let width = bits.div_ceil(8) as usize;
         let mut md5 = Md5::new();
         let mut count = 0;
+        // The decoder works in batches: frames come out later than their
+        // packets, but in the same order.
+        let mut frames = Vec::new();
         for p in packets {
-            for f in decoder.decode(p)? {
+            frames.extend(decoder.decode(p)?);
+        }
+        frames.extend(decoder.flush()?);
+        assert_eq!(frames.len(), packets.len());
+        for (f, p) in frames.into_iter().zip(packets) {
+            {
                 let Frame::Audio(a) = f else {
                     panic!("expected audio");
                 };
@@ -691,7 +699,6 @@ mod tests {
                 }
             }
         }
-        decoder.flush()?;
         Ok((to_hex(&md5.finalize()), count))
     }
 
@@ -1193,12 +1200,11 @@ mod tests {
                     p.data[n - 2..].copy_from_slice(&crc.to_be_bytes());
                 }
                 let mut decoder = new_decoder(&stream).unwrap();
-                match decoder.decode(&p) {
+                match decoder.decode(&p).and_then(|_| decoder.flush()) {
                     Ok(_) => outcomes[0] += 1,
                     Err(Error::InvalidData(m)) if m.contains("CRC") => outcomes[1] += 1,
                     Err(_) => outcomes[2] += 1,
                 }
-                let _ = decoder.flush();
             }
         }
         // Most cases must get past both CRCs into the subframe parser.
