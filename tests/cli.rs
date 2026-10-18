@@ -186,3 +186,39 @@ fn output_does_not_depend_on_the_thread_count() {
         wav_samples(&dir.join("in.wav"))
     );
 }
+
+#[test]
+fn decode_error_in_the_last_batch_fails_the_run() {
+    use ferrompeg::util::crc::{crc8, crc16};
+    let dir = scratch("bad-flac");
+    let wav = dir.join("a.wav");
+    let flac = dir.join("a.flac");
+    run(&["-f", "lavfi", "-i", "sine=d=1", wav.to_str().unwrap()]);
+    run(&["-i", wav.to_str().unwrap(), flac.to_str().unwrap()]);
+
+    // Frame starts: sync code, frame number in one byte, valid CRC-8.
+    let mut bytes = std::fs::read(&flac).unwrap();
+    let starts: Vec<usize> = (0..bytes.len() - 6)
+        .filter(|&i| {
+            bytes[i] == 0xFF && bytes[i + 1] == 0xF8 && crc8(&bytes[i..i + 5]) == bytes[i + 5]
+        })
+        .collect();
+    assert!(starts.len() >= 8, "{} frames found", starts.len());
+    // Give frame 4 a reserved subframe type, with CRC-16 recomputed so the
+    // demuxer still hands it to the decoder: frames 0 to 3 decode first.
+    let (start, end) = (starts[4], starts[5]);
+    assert_eq!(bytes[start + 4], 4);
+    bytes[start + 6] = 0x04;
+    let crc = crc16(&bytes[start..end - 2]);
+    bytes[end - 2..end].copy_from_slice(&crc.to_be_bytes());
+    let bad = dir.join("bad.flac");
+    std::fs::write(&bad, &bytes).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ferrompeg"))
+        .args(["-hide_banner", "-nostats", "-v", "error", "-y", "-i"])
+        .arg(&bad)
+        .arg(dir.join("bad.wav"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "a corrupt frame must fail the run");
+}

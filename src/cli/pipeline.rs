@@ -96,7 +96,16 @@ impl Input {
         if let InputKind::Demux { decoders, .. } = &mut self.kind {
             for (i, d) in decoders.iter_mut().enumerate() {
                 if let Some(d) = d {
-                    out.extend(d.flush()?.into_iter().map(|f| (i, f)));
+                    // A batching decoder returns the frames decoded before
+                    // an error first and the error on the next call, so
+                    // flush until nothing is left.
+                    loop {
+                        let frames = d.flush()?;
+                        if frames.is_empty() {
+                            break;
+                        }
+                        out.extend(frames.into_iter().map(|f| (i, f)));
+                    }
                 }
             }
         }
