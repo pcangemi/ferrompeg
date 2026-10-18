@@ -69,6 +69,7 @@ use crate::error::{Error, Result};
 use crate::frame::{Frame, FrameFormat, PixelFormat, VideoFormat};
 use crate::rational::Rational;
 use crate::stream::{CodecId, Packet, StreamInfo, StreamParams, VideoParams};
+use crate::util::parallel;
 
 /// LZW codes are at most 12 bits wide, so the code table holds 4096 entries.
 const MAX_CODES: usize = 4096;
@@ -98,6 +99,9 @@ const COARSE_LIMIT: usize = 32768;
 /// pixel.
 const GLOBAL_TOLERANCE: f64 = 1.25;
 const GLOBAL_MARGIN: f64 = 2.0;
+
+/// Memory allowed for pictures waiting to be encoded together.
+const BATCH_BYTES: usize = 128 << 20;
 
 /// Disposal method 1 from the graphic control extension: leave the image
 /// in place, so later images only need to cover what changed.
@@ -152,8 +156,27 @@ pub struct GifEncoder {
     /// Color table of the first picture, which the muxer turns into the
     /// global color table; later pictures reuse it when it suits them.
     global: Option<Vec<[u8; 3]>>,
-    /// Nearest palette index per reduced color, kept to reuse the buffer.
-    cache: Vec<u16>,
+    /// Pictures whose delay is known, waiting to be encoded in one batch.
+    queue: Vec<Ready>,
+    batch: usize,
+}
+
+/// A picture ready to be encoded, shown from `pts` to `end_pts`.
+struct Ready {
+    pixels: Vec<u8>,
+    pts: i64,
+    end_pts: i64,
+    delay: u16,
+}
+
+/// What encoding one picture needs to know besides its pixels. Pictures
+/// only depend on the source pixels of the one before and on the first
+/// picture's color table, so all but the first can be encoded in parallel.
+struct Canvas<'a> {
+    width: usize,
+    height: usize,
+    previous: Option<&'a [u8]>,
+    global: Option<&'a [[u8; 3]]>,
 }
 
 impl GifEncoder {
@@ -180,7 +203,9 @@ impl GifEncoder {
             previous: None,
             pending: None,
             global: None,
-            cache: Vec::new(),
+            queue: Vec::new(),
+            batch: (BATCH_BYTES / (width as usize * height as usize * 3))
+                .clamp(1, parallel::threads() * 2),
         })
     }
 
@@ -189,207 +214,253 @@ impl GifEncoder {
         Rational::rescale(pts, self.time_base, Rational::new(1, 100))
     }
 
-    /// Encodes the pending picture, shown from `pending.pts` to `end_pts`.
-    fn emit(&mut self, pending: Pending, end_pts: i64, delay: i64) -> Packet {
-        let delay = delay.clamp(1, MAX_DELAY) as u16;
-        let keyframe = self.previous.is_none();
-        let data = self.encode_picture(&pending.pixels, delay);
-        self.previous = Some(pending.pixels);
+    /// Queues the pending picture, shown from `pending.pts` to `end_pts`,
+    /// and encodes the queue once a batch is complete.
+    fn emit(&mut self, pending: Pending, end_pts: i64, delay: i64) -> Vec<Packet> {
+        self.queue.push(Ready {
+            pixels: pending.pixels,
+            pts: pending.pts,
+            end_pts,
+            delay: delay.clamp(1, MAX_DELAY) as u16,
+        });
+        if self.queue.len() >= self.batch {
+            self.encode_queue()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Encodes every queued picture, in parallel, and returns the packets
+    /// in order.
+    fn encode_queue(&mut self) -> Vec<Packet> {
+        let queue = std::mem::take(&mut self.queue);
+        let (width, height) = (self.format.width as usize, self.format.height as usize);
+        let mut packets = Vec::with_capacity(queue.len());
+        let mut rest = &queue[..];
+        if self.global.is_none() {
+            // The first picture decides the global color table, which the
+            // others need.
+            let Some((first, others)) = rest.split_first() else {
+                return packets;
+            };
+            let canvas = Canvas {
+                width,
+                height,
+                previous: None,
+                global: None,
+            };
+            let (data, table) = encode_picture(&canvas, &first.pixels, first.delay);
+            self.global = Some(table);
+            packets.push(self.packet(first, data, true));
+            self.previous = Some(first.pixels.clone());
+            rest = others;
+        }
+        let previous = self.previous.as_deref();
+        let global = self.global.as_deref();
+        let indices: Vec<usize> = (0..rest.len()).collect();
+        let encoded = parallel::map(&indices, |&i| {
+            let canvas = Canvas {
+                width,
+                height,
+                previous: if i == 0 {
+                    previous
+                } else {
+                    Some(&rest[i - 1].pixels)
+                },
+                global,
+            };
+            encode_picture(&canvas, &rest[i].pixels, rest[i].delay).0
+        });
+        for (ready, data) in rest.iter().zip(encoded) {
+            packets.push(self.packet(ready, data, false));
+        }
+        if let Some(last) = rest.last() {
+            self.previous = Some(last.pixels.clone());
+        }
+        packets
+    }
+
+    fn packet(&self, ready: &Ready, data: Vec<u8>, keyframe: bool) -> Packet {
         let mut packet = Packet::new(
             self.stream_index,
             data,
-            pending.pts,
-            (end_pts - pending.pts).max(1),
+            ready.pts,
+            (ready.end_pts - ready.pts).max(1),
         );
         // Later images only patch the canvas left by the earlier ones.
         packet.keyframe = keyframe;
         packet
     }
-
-    fn encode_picture(&mut self, pixels: &[u8], delay: u16) -> Vec<u8> {
-        let width = self.format.width as usize;
-        let height = self.format.height as usize;
-        let full = Rect {
-            x: 0,
-            y: 0,
-            width,
-            height,
-        };
-        // `opaque` marks the pixels of the rectangle that must be encoded;
-        // `None` means all of them.
-        let (rect, opaque) = match &self.previous {
-            None => (full, None),
-            Some(prev) => match changed_rect(prev, pixels, width, height) {
-                None => {
-                    // Nothing changed but time still has to pass: a single
-                    // transparent pixel carries the delay.
-                    let rect = Rect {
-                        x: 0,
-                        y: 0,
-                        width: 1,
-                        height: 1,
-                    };
-                    (rect, Some(vec![false]))
-                }
-                Some(rect) => {
-                    let mask = changed_mask(prev, pixels, width, rect);
-                    let unchanged = mask.iter().filter(|&&m| !m).count();
-                    if unchanged > 0 && unchanged * 16 >= mask.len() {
-                        (rect, Some(mask))
-                    } else {
-                        (rect, None)
-                    }
-                }
-            },
-        };
-
-        let mapped = self.map_picture(pixels, width, rect, opaque.as_deref());
-        if self.global.is_none() {
-            self.global = Some(mapped.table.clone());
-        }
-        let size_bits = table_size_bits(mapped.table.len());
-        let min_code_size = (size_bits as u8 + 1).max(2);
-
-        let mut out = Vec::with_capacity(32 + 3 * mapped.table.len() + mapped.indices.len() / 2);
-        // Graphic control extension.
-        out.extend_from_slice(&[0x21, 0xF9, 0x04]);
-        out.push((DISPOSAL_KEEP << 2) | mapped.transparent.is_some() as u8);
-        out.extend_from_slice(&delay.to_le_bytes());
-        out.push(mapped.transparent.unwrap_or(0));
-        out.push(0x00);
-        // Image descriptor: local color table present, not interlaced.
-        out.push(0x2C);
-        for v in [rect.x, rect.y, rect.width, rect.height] {
-            out.extend_from_slice(&(v as u16).to_le_bytes());
-        }
-        out.push(0x80 | size_bits as u8);
-        for c in &mapped.table {
-            out.extend_from_slice(c);
-        }
-        let indices = mapped.indices;
-        // Indices are below the table size by construction, so this
-        // cannot fail.
-        if let Err(e) = lzw_compress(&indices, min_code_size, &mut out) {
-            debug_assert!(false, "{e}");
-        }
-        out
-    }
 }
 
-impl GifEncoder {
-    /// Chooses a color table for the pixels of `rect` (those in `opaque`
-    /// only, when given) and maps them to it.
-    fn map_picture(
-        &mut self,
-        pixels: &[u8],
-        width: usize,
-        rect: Rect,
-        opaque: Option<&[bool]>,
-    ) -> Mapped {
-        let keys = rect_keys(pixels, width, rect, opaque);
-        let bins = histogram(&keys);
-        let slots = if opaque.is_some() { 255 } else { 256 };
-        let (palette, exact) = build_palette(&bins, slots);
+/// Encodes one picture as a graphic control extension and an image, and
+/// returns it with the color table it uses.
+fn encode_picture(canvas: &Canvas, pixels: &[u8], delay: u16) -> (Vec<u8>, Vec<[u8; 3]>) {
+    let (width, height) = (canvas.width, canvas.height);
+    let full = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    // `opaque` marks the pixels of the rectangle that must be encoded;
+    // `None` means all of them.
+    let (rect, opaque) = match canvas.previous {
+        None => (full, None),
+        Some(prev) => match changed_rect(prev, pixels, width, height) {
+            None => {
+                // Nothing changed but time still has to pass: a single
+                // transparent pixel carries the delay.
+                let rect = Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                };
+                (rect, Some(vec![false]))
+            }
+            Some(rect) => {
+                let mask = changed_mask(prev, pixels, width, rect);
+                let unchanged = mask.iter().filter(|&&m| !m).count();
+                if unchanged > 0 && unchanged * 16 >= mask.len() {
+                    (rect, Some(mask))
+                } else {
+                    (rect, None)
+                }
+            }
+        },
+    };
 
-        // Reusing the first picture's table lets the muxer drop the local
-        // table altogether (it becomes the global one), saving up to 768
-        // bytes per picture. Only do it when the table renders these
-        // colors about as well as a fresh palette, and never at the cost
-        // of an exact rendering.
-        if let Some(global) = self.global.take() {
-            let reused = if global_is_good_enough(&global, &bins, &palette, exact) {
-                self.map_to_global(&global, exact, pixels, width, rect, opaque)
-            } else {
-                None
-            };
-            self.global = Some(global);
-            if let Some(m) = reused {
+    let mapped = map_picture(canvas.global, pixels, width, rect, opaque.as_deref());
+    let size_bits = table_size_bits(mapped.table.len());
+    let min_code_size = (size_bits as u8 + 1).max(2);
+
+    let mut out = Vec::with_capacity(32 + 3 * mapped.table.len() + mapped.indices.len() / 2);
+    // Graphic control extension.
+    out.extend_from_slice(&[0x21, 0xF9, 0x04]);
+    out.push((DISPOSAL_KEEP << 2) | mapped.transparent.is_some() as u8);
+    out.extend_from_slice(&delay.to_le_bytes());
+    out.push(mapped.transparent.unwrap_or(0));
+    out.push(0x00);
+    // Image descriptor: local color table present, not interlaced.
+    out.push(0x2C);
+    for v in [rect.x, rect.y, rect.width, rect.height] {
+        out.extend_from_slice(&(v as u16).to_le_bytes());
+    }
+    out.push(0x80 | size_bits as u8);
+    for c in &mapped.table {
+        out.extend_from_slice(c);
+    }
+    // Indices are below the table size by construction, so this cannot
+    // fail.
+    if let Err(e) = lzw_compress(&mapped.indices, min_code_size, &mut out) {
+        debug_assert!(false, "{e}");
+    }
+    (out, mapped.table)
+}
+
+/// Chooses a color table for the pixels of `rect` (those in `opaque` only,
+/// when given) and maps them to it.
+fn map_picture(
+    global: Option<&[[u8; 3]]>,
+    pixels: &[u8],
+    width: usize,
+    rect: Rect,
+    opaque: Option<&[bool]>,
+) -> Mapped {
+    let keys = rect_keys(pixels, width, rect, opaque);
+    let bins = histogram(&keys);
+    let slots = if opaque.is_some() { 255 } else { 256 };
+    let (palette, exact) = build_palette(&bins, slots);
+
+    // Reusing the first picture's table lets the muxer drop the local
+    // table altogether (it becomes the global one), saving up to 768 bytes
+    // per picture. Only do it when the table renders these colors about as
+    // well as a fresh palette, and never at the cost of an exact rendering.
+    if let Some(global) = global {
+        if global_is_good_enough(global, &bins, &palette, exact) {
+            if let Some(m) = map_to_global(global, exact, pixels, width, rect, opaque) {
                 return m;
             }
         }
-
-        let mut indices = self.map_indices(&palette, exact, pixels, width, rect, opaque);
-        // A fresh palette keeps the slot after its colors for transparency.
-        let transparent = opaque.map(|mask| {
-            let index = palette.len() as u8;
-            set_transparent(&mut indices, mask, index);
-            index
-        });
-        let mut table = palette;
-        let used = table.len() + transparent.is_some() as usize;
-        table.resize(2usize << table_size_bits(used), [0, 0, 0]);
-        Mapped {
-            table,
-            indices,
-            transparent,
-        }
     }
 
-    /// Maps the picture to the global table. When some pixels must be
-    /// transparent, the transparent index is an entry no encoded pixel
-    /// uses; returns `None` if every entry is taken.
-    fn map_to_global(
-        &mut self,
-        global: &[[u8; 3]],
-        exact: bool,
-        pixels: &[u8],
-        width: usize,
-        rect: Rect,
-        opaque: Option<&[bool]>,
-    ) -> Option<Mapped> {
-        let mut indices = self.map_indices(global, exact, pixels, width, rect, opaque);
-        let transparent = match opaque {
-            None => None,
-            Some(mask) => {
-                let mut used = [false; 256];
-                for (&i, &keep) in indices.iter().zip(mask) {
-                    if keep {
-                        used[i as usize] = true;
-                    }
+    let mut indices = map_indices(&palette, exact, pixels, width, rect, opaque);
+    // A fresh palette keeps the slot after its colors for transparency.
+    let transparent = opaque.map(|mask| {
+        let index = palette.len() as u8;
+        set_transparent(&mut indices, mask, index);
+        index
+    });
+    let mut table = palette;
+    let used = table.len() + transparent.is_some() as usize;
+    table.resize(2usize << table_size_bits(used), [0, 0, 0]);
+    Mapped {
+        table,
+        indices,
+        transparent,
+    }
+}
+
+/// Maps the picture to the global table. When some pixels must be
+/// transparent, the transparent index is an entry no encoded pixel uses;
+/// returns `None` if every entry is taken.
+fn map_to_global(
+    global: &[[u8; 3]],
+    exact: bool,
+    pixels: &[u8],
+    width: usize,
+    rect: Rect,
+    opaque: Option<&[bool]>,
+) -> Option<Mapped> {
+    let mut indices = map_indices(global, exact, pixels, width, rect, opaque);
+    let transparent = match opaque {
+        None => None,
+        Some(mask) => {
+            let mut used = [false; 256];
+            for (&i, &keep) in indices.iter().zip(mask) {
+                if keep {
+                    used[i as usize] = true;
                 }
-                let free = (0..global.len()).find(|&i| !used[i])? as u8;
-                set_transparent(&mut indices, mask, free);
-                Some(free)
             }
-        };
-        Some(Mapped {
-            table: global.to_vec(),
-            indices,
-            transparent,
-        })
-    }
+            let free = (0..global.len()).find(|&i| !used[i])? as u8;
+            set_transparent(&mut indices, mask, free);
+            Some(free)
+        }
+    };
+    Some(Mapped {
+        table: global.to_vec(),
+        indices,
+        transparent,
+    })
+}
 
-    /// Maps pixels to `palette`: by lookup when `exact` says every color
-    /// is in it, with error diffusion otherwise. Pixels outside `opaque`
-    /// get index 0 until the caller picks a transparent index.
-    fn map_indices(
-        &mut self,
-        palette: &[[u8; 3]],
-        exact: bool,
-        pixels: &[u8],
-        width: usize,
-        rect: Rect,
-        opaque: Option<&[bool]>,
-    ) -> Vec<u8> {
-        if exact {
-            let mut lookup: Vec<(u32, u8)> = palette
-                .iter()
-                .enumerate()
-                .map(|(i, c)| (color_key(c), i as u8))
-                .collect();
-            // Stable sort and dedup keep the first index of a repeated
-            // color (padding entries are black).
-            lookup.sort_by_key(|&(k, _)| k);
-            lookup.dedup_by_key(|(k, _)| *k);
-            return map_exact(pixels, width, rect, opaque, &lookup);
-        }
-        if self.cache.len() != CACHE_SIZE {
-            self.cache = vec![CACHE_EMPTY; CACHE_SIZE];
-        } else {
-            self.cache.fill(CACHE_EMPTY);
-        }
-        dither(pixels, width, rect, opaque, palette, &mut self.cache)
+/// Maps pixels to `palette`: by lookup when `exact` says every color is in
+/// it, with error diffusion otherwise. Pixels outside `opaque` get index 0
+/// until the caller picks a transparent index.
+fn map_indices(
+    palette: &[[u8; 3]],
+    exact: bool,
+    pixels: &[u8],
+    width: usize,
+    rect: Rect,
+    opaque: Option<&[bool]>,
+) -> Vec<u8> {
+    if exact {
+        let mut lookup: Vec<(u32, u8)> = palette
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (color_key(c), i as u8))
+            .collect();
+        // Stable sort and dedup keep the first index of a repeated color
+        // (padding entries are black).
+        lookup.sort_by_key(|&(k, _)| k);
+        lookup.dedup_by_key(|(k, _)| *k);
+        return map_exact(pixels, width, rect, opaque, &lookup);
     }
+    // Nearest palette index per reduced color.
+    let mut cache = vec![CACHE_EMPTY; CACHE_SIZE];
+    dither(pixels, width, rect, opaque, palette, &mut cache)
 }
 
 /// A picture mapped to a color table.
@@ -496,18 +567,23 @@ impl Encoder for GifEncoder {
             self.pending = Some(next);
             return Ok(Vec::new());
         }
-        let packet = self.emit(pending, pts, delay);
+        let packets = self.emit(pending, pts, delay);
         self.pending = Some(next);
-        Ok(vec![packet])
+        Ok(packets)
     }
 
     fn flush(&mut self) -> Result<Vec<Packet>> {
-        let Some(pending) = self.pending.take() else {
-            return Ok(Vec::new());
-        };
-        let end = pending.last_pts + 1;
-        let delay = self.centiseconds(end) - self.centiseconds(pending.pts);
-        Ok(vec![self.emit(pending, end, delay)])
+        if let Some(pending) = self.pending.take() {
+            let end = pending.last_pts + 1;
+            let delay = self.centiseconds(end) - self.centiseconds(pending.pts);
+            self.queue.push(Ready {
+                pixels: pending.pixels,
+                pts: pending.pts,
+                end_pts: end,
+                delay: delay.clamp(1, MAX_DELAY) as u16,
+            });
+        }
+        Ok(self.encode_queue())
     }
 
     fn stream_info(&self) -> StreamInfo {
