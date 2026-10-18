@@ -22,6 +22,7 @@ Global options:
   -hide_banner      do not print the version line
   -v LEVEL          quiet, error, warning, info, verbose
   -nostats          do not print the progress line
+  -threads N        worker threads (default: one per core, 1 to disable)
 
 Input options (before -i):
   -f FORMAT         force the format (raw PCM such as s16le, rawvideo, lavfi)
@@ -128,6 +129,9 @@ pub fn main(args: Vec<String>) -> i32 {
             return 1;
         }
     };
+    if let Some(n) = global.threads {
+        crate::util::parallel::set_threads(n);
+    }
     if let Some(level) = global.log_level {
         log::set_level(level);
     }

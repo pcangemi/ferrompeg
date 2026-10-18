@@ -18,6 +18,8 @@ pub struct GlobalOptions {
     pub hide_banner: bool,
     pub log_level: Option<LogLevel>,
     pub stats: bool,
+    /// `-threads`: 0 or `None` for one thread per core.
+    pub threads: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -93,6 +95,7 @@ fn lookup(name: &str) -> Option<(&'static str, Scope, bool)> {
         "loglevel" | "v" => ("loglevel", Global, true),
         "stats" => ("stats", Global, false),
         "nostats" => ("nostats", Global, false),
+        "threads" => ("threads", Global, true),
         "f" => ("f", Both, true),
         "ss" => ("ss", Both, true),
         "t" => ("t", Both, true),
@@ -192,6 +195,13 @@ fn apply_global(global: &mut GlobalOptions, name: &str, value: &str) -> Result<(
         "hide_banner" => global.hide_banner = true,
         "stats" => global.stats = true,
         "nostats" => global.stats = false,
+        "threads" => {
+            global.threads = Some(if value.trim() == "auto" {
+                0
+            } else {
+                parse_u32(name, value)? as usize
+            })
+        }
         "loglevel" => {
             // Allow "repeat+level" style prefixes by keeping the last part.
             let level = value.rsplit('+').next().unwrap_or(value);
