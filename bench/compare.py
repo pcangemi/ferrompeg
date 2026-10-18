@@ -32,8 +32,8 @@ MUSIC = (
     "+0.15*sin(2*PI*440*t)+0.1*sin(2*PI*1320*t)*exp(-mod(t+0.25,0.5)*8)'"
     ":s=44100:d=120"
 )
-NOISE = "anoisesrc=c=pink:a=0.04:r=44100:d=120"
-CLIP = "testsrc2=s=1280x720:r=25:d=10,noise=alls=12:allf=t"
+NOISE = "anoisesrc=c=pink:a=0.04:r=44100:d=120:seed=1"
+CLIP = "testsrc2=s=1280x720:r=25:d=10,noise=alls=12:allf=t:all_seed=1"
 
 # (name, label, input args, output args, output extension)
 CASES = [
@@ -58,6 +58,7 @@ CASES = [
 
 TOOLS = {
     "ferrompeg": lambda i, o: [FERROMPEG, *QUIET, *i, *o],
+    "ferrompeg_1t": lambda i, o: [FERROMPEG, *QUIET, "-threads", "1", *i, *o],
     "ffmpeg": lambda i, o: [FFMPEG, "-nostdin", *QUIET, *i, *o],
     "ffmpeg_1t": lambda i, o: [FFMPEG, "-nostdin", *QUIET, "-filter_threads", "1",
                                "-threads", "1", *i, "-threads", "1", *o],
@@ -105,8 +106,9 @@ def main():
     subprocess.run(["cargo", "build", "--release", "--quiet"], cwd=ROOT, check=True)
     prepare(args.workdir)
 
-    print("| Task | ferrompeg | ffmpeg | ffmpeg, 1 thread | ferrompeg vs ffmpeg |")
-    print("| --- | ---: | ---: | ---: | --- |")
+    print("| Task | ferrompeg | ffmpeg | ferrompeg vs ffmpeg | ferrompeg, 1 thread "
+          "| ffmpeg, 1 thread |")
+    print("| --- | ---: | ---: | --- | ---: | ---: |")
     for name, label, inp, outp, ext in CASES:
         if args.cases and name not in args.cases:
             continue
@@ -116,9 +118,9 @@ def main():
             cmd = build(inp.split(), [*outp.split(), dst])
             run(cmd, args.workdir)
             medians[tool] = statistics.median(run(cmd, args.workdir) for _ in range(args.runs))
-        ours, theirs, single = medians["ferrompeg"], medians["ffmpeg"], medians["ffmpeg_1t"]
-        print(f"| {label} | {ours:.3f} s | {theirs:.3f} s | {single:.3f} s | "
-              f"{format_ratio(ours, theirs)} |", flush=True)
+        ours, theirs = medians["ferrompeg"], medians["ffmpeg"]
+        print(f"| {label} | {ours:.3f} s | {theirs:.3f} s | {format_ratio(ours, theirs)} | "
+              f"{medians['ferrompeg_1t']:.3f} s | {medians['ffmpeg_1t']:.3f} s |", flush=True)
 
 
 if __name__ == "__main__":
