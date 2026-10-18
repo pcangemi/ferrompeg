@@ -1,0 +1,13 @@
+/target
+*.wav
+*.flac
+*.y4m
+*.gif
+*.raw
+*.pcm
+*.aiff
+*.au
+*.ppm
+*.pgm
+*.bmp
+!tests/fixtures/**

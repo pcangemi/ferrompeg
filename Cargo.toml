@@ -1,0 +1,20 @@
+[package]
+name = "ferrompeg"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Pierre CANGEMI"]
+description = "A small multimedia toolkit in pure Rust with an ffmpeg-style command line"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pcangemi/ferrompeg"
+readme = "README.md"
+keywords = ["audio", "video", "flac", "wav", "multimedia"]
+categories = ["multimedia", "multimedia::audio", "multimedia::video", "command-line-utilities"]
+
+# No dependencies on purpose: every container, codec and filter is written
+# against its specification, so the whole pipeline can be read in one place.
+[dependencies]
+
+[profile.release]
+lto = true
+codegen-units = 1
