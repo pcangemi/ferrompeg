@@ -29,6 +29,7 @@
 //! linearly for each output sample.
 
 use crate::error::{Error, Result};
+use crate::util::dot::dot;
 
 /// Highest rate accepted on either side.
 const MAX_RATE: u32 = 768_000;
@@ -68,10 +69,12 @@ struct State {
     /// around the integer part `pos` of each output position.
     half: usize,
     kernel: Kernel,
-    /// Input frames, interleaved, starting at absolute frame `hist_start`.
-    /// The history starts with `half` frames of silence before time 0,
-    /// which is what centres the first output samples on the first input.
-    history: Vec<f32>,
+    /// Input samples of each channel, starting at absolute frame
+    /// `hist_start`. The history starts with `half` frames of silence
+    /// before time 0, which is what centres the first output samples on
+    /// the first input. Channels are kept apart so the filter runs over
+    /// contiguous memory.
+    history: Vec<Vec<f32>>,
     hist_start: i64,
     received: u64,
     produced: u64,
@@ -79,8 +82,7 @@ struct State {
     /// `pos + rem / up`, kept as exact integers so it never drifts.
     pos: i64,
     rem: u64,
-    weights: Vec<f64>,
-    acc: Vec<f64>,
+    weights: Vec<f32>,
 }
 
 enum Kernel {
@@ -159,14 +161,13 @@ impl Resampler {
                 down,
                 half,
                 kernel,
-                history: vec![0.0; half * channels],
+                history: vec![vec![0.0; half]; channels],
                 hist_start: -(half as i64),
                 received: 0,
                 produced: 0,
                 pos: 0,
                 rem: 0,
                 weights: vec![0.0; taps],
-                acc: vec![0.0; channels],
             })),
         })
     }
@@ -181,7 +182,9 @@ impl Resampler {
         let Some(state) = self.state.as_mut() else {
             return input.to_vec();
         };
-        state.history.extend_from_slice(input);
+        for (c, h) in state.history.iter_mut().enumerate() {
+            h.extend(input[c..].iter().step_by(self.channels));
+        }
         state.received += (whole / self.channels) as u64;
         let target = state.expected_len();
         let mut out = Vec::new();
@@ -190,9 +193,9 @@ impl Resampler {
         // downsampling, where the filter can be shorter than one output
         // period and the rounded final length is not yet known.
         while state.produced < target && state.pos + (state.half as i64) < state.received as i64 {
-            state.emit(self.channels, &mut out);
+            state.emit(&mut out);
         }
-        state.discard_consumed(self.channels);
+        state.discard_consumed();
         out
     }
 
@@ -200,24 +203,25 @@ impl Resampler {
     /// treating everything after the last input sample as silence. The
     /// resampler is then ready for a new stream.
     pub fn flush(&mut self) -> Vec<f32> {
-        let channels = self.channels;
         let Some(state) = self.state.as_mut() else {
             return Vec::new();
         };
         let target = state.expected_len();
         let mut out = Vec::new();
         while state.produced < target {
-            let needed = state.pos + state.half as i64 + 1 - state.hist_start;
-            let have = (state.history.len() / channels) as i64;
-            if needed > have {
-                let extra = (needed - have) as usize * channels;
-                state.history.resize(state.history.len() + extra, 0.0);
+            let needed = (state.pos + state.half as i64 + 1 - state.hist_start) as usize;
+            for h in &mut state.history {
+                if needed > h.len() {
+                    h.resize(needed, 0.0);
+                }
             }
-            state.emit(channels, &mut out);
-            state.discard_consumed(channels);
+            state.emit(&mut out);
+            state.discard_consumed();
         }
-        state.history.clear();
-        state.history.resize(state.half * channels, 0.0);
+        for h in &mut state.history {
+            h.clear();
+            h.resize(state.half, 0.0);
+        }
         state.hist_start = -(state.half as i64);
         state.received = 0;
         state.produced = 0;
@@ -238,35 +242,27 @@ impl State {
 
     /// Computes one output frame and advances the position. The caller
     /// guarantees the history covers the filter span.
-    fn emit(&mut self, channels: usize, out: &mut Vec<f32>) {
+    fn emit(&mut self, out: &mut Vec<f32>) {
         let taps = 2 * self.half;
-        let weights: &[f64] = match &self.kernel {
-            Kernel::Polyphase(rows) => {
-                let row = &rows[self.rem as usize * taps..][..taps];
-                for (w, &c) in self.weights.iter_mut().zip(row) {
-                    *w = c as f64;
-                }
-                &self.weights
-            }
+        let weights: &[f32] = match &self.kernel {
+            Kernel::Polyphase(rows) => &rows[self.rem as usize * taps..][..taps],
             Kernel::Table { table, scale } => {
                 let frac = self.rem as f64 / self.up as f64;
-                for (t, w) in self.weights.iter_mut().enumerate() {
-                    *w = lookup(table, tap_offset(t, self.half, frac).abs() * scale);
+                let mut row: Vec<f64> = (0..taps)
+                    .map(|t| lookup(table, tap_offset(t, self.half, frac).abs() * scale))
+                    .collect();
+                normalize(&mut row);
+                for (w, r) in self.weights.iter_mut().zip(row) {
+                    *w = r as f32;
                 }
-                normalize(&mut self.weights);
                 &self.weights
             }
         };
         let first = (self.pos - self.half as i64 + 1 - self.hist_start) as usize;
-        let span = &self.history[first * channels..(first + taps) * channels];
-        self.acc.iter_mut().for_each(|a| *a = 0.0);
         // Fixed summation order: the same output for any chunking.
-        for (frame, &w) in span.chunks_exact(channels).zip(weights) {
-            for (a, &x) in self.acc.iter_mut().zip(frame) {
-                *a += w * x as f64;
-            }
+        for h in &self.history {
+            out.push(dot(&h[first..first + taps], weights));
         }
-        out.extend(self.acc.iter().map(|&a| a as f32));
         self.produced += 1;
         self.rem += self.down;
         self.pos += (self.rem / self.up) as i64;
@@ -274,12 +270,14 @@ impl State {
     }
 
     /// Drops input frames no future output can reach.
-    fn discard_consumed(&mut self, channels: usize) {
+    fn discard_consumed(&mut self) {
         let first_needed = self.pos - self.half as i64 + 1;
-        let have = (self.history.len() / channels) as i64;
+        let have = self.history[0].len() as i64;
         let drop = (first_needed - self.hist_start).clamp(0, have);
         if drop > 0 {
-            self.history.drain(..drop as usize * channels);
+            for h in &mut self.history {
+                h.drain(..drop as usize);
+            }
             self.hist_start += drop;
         }
     }
