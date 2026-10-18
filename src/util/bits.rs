@@ -215,7 +215,10 @@ impl BitWriter {
     /// Writes a signed value Rice coded with parameter `k`, the inverse of
     /// [`BitReader::read_rice_signed`].
     pub fn write_rice_signed(&mut self, value: i32, k: u32) {
-        let u = ((value << 1) ^ (value >> 31)) as u32;
+        // Zigzag in 64 bits: `value << 1` would overflow an i32 for
+        // magnitudes of 2^30 and above.
+        let v = value as i64;
+        let u = ((v << 1) ^ (v >> 63)) as u32;
         self.write_unary(u >> k);
         if k > 0 {
             self.write_bits(u, k);
@@ -293,6 +296,19 @@ mod tests {
             for &v in &values {
                 assert_eq!(r.read_rice_signed(k).unwrap(), v, "k={k}");
             }
+        }
+    }
+
+    #[test]
+    fn rice_extremes_do_not_overflow() {
+        let mut w = BitWriter::new();
+        for v in [i32::MAX, i32::MIN, 1 << 30, -(1 << 30)] {
+            w.write_rice_signed(v, 30);
+        }
+        let bytes = w.into_bytes();
+        let mut r = BitReader::new(&bytes);
+        for v in [i32::MAX, i32::MIN, 1 << 30, -(1 << 30)] {
+            assert_eq!(r.read_rice_signed(30).unwrap(), v);
         }
     }
 
