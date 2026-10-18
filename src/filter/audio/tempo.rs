@@ -17,6 +17,7 @@
 use crate::error::{Error, Result};
 use crate::filter::{Args, Filter};
 use crate::frame::{AudioFrame, Frame};
+use crate::util::dot::dot;
 
 use super::{expect_audio, float_frames};
 
@@ -202,30 +203,28 @@ impl State {
         let base = self.in_start;
         let t0 = (self.prev_pos + hop as i64 - base) as usize;
         let target = &self.mono[t0..t0 + hop];
-        let candidate = |c: i64| {
-            let start = (c - base) as usize;
-            &self.mono[start..start + hop]
-        };
-        let score = |c: i64| {
-            let seg = candidate(c);
-            let mut dot = 0.0f64;
-            let mut energy = 0.0f64;
-            for (&t, &s) in target.iter().zip(seg) {
-                dot += t as f64 * s as f64;
-                energy += s as f64 * s as f64;
+        let first = (lo - base) as usize;
+        let span = &self.mono[first..(hi - base) as usize + hop];
+        // Energy of each candidate window, slid one sample at a time.
+        let mut energy: f64 = span[..hop].iter().map(|&s| s as f64 * s as f64).sum();
+        let mut scores = Vec::with_capacity((hi - lo + 1) as usize);
+        for k in 0..=(hi - lo) as usize {
+            if k > 0 {
+                let (out, inp) = (span[k - 1] as f64, span[k + hop - 1] as f64);
+                energy = (energy + inp * inp - out * out).max(0.0);
             }
-            if energy > 0.0 {
+            let dot = dot(target, &span[k..k + hop]) as f64;
+            scores.push(if energy > 1e-12 {
                 dot / energy.sqrt()
             } else {
                 0.0
-            }
-        };
+            });
+        }
         let mut best = nominal.clamp(lo, hi);
-        let mut best_score = score(best);
-        for c in lo..=hi {
-            let s = score(c);
+        let mut best_score = scores[(best - lo) as usize];
+        for (k, &s) in scores.iter().enumerate() {
             if s > best_score {
-                best = c;
+                best = lo + k as i64;
                 best_score = s;
             }
         }
