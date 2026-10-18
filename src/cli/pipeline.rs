@@ -282,7 +282,11 @@ struct OutStream {
     trim: Option<Trim>,
     frame_limit: Option<u64>,
     frames_out: u64,
-    finished: bool,
+    /// Set once the output time window has ended: no more input is taken,
+    /// but frames still buffered in filters are flushed and encoded.
+    input_done: bool,
+    /// Set once the frame limit is reached: nothing more is encoded.
+    output_done: bool,
     /// End time of the last frame or packet written, for progress.
     position: f64,
     mode: Mode,
@@ -370,7 +374,7 @@ impl OutStream {
     /// Sends one decoded frame through trimming, filters, conversion and
     /// the encoder.
     fn push_frame(&mut self, frame: Frame, sink: &mut Sink) -> Result<()> {
-        if self.finished {
+        if self.input_done || self.output_done {
             return Ok(());
         }
         let frame = match self.trim.map(|t| t.apply(frame.clone())) {
@@ -378,7 +382,7 @@ impl OutStream {
             Some(Trimmed::Keep(f)) => f,
             Some(Trimmed::Before) => return Ok(()),
             Some(Trimmed::After) => {
-                self.finished = true;
+                self.input_done = true;
                 return Ok(());
             }
         };
@@ -396,7 +400,7 @@ impl OutStream {
         let Mode::Transcode(t) = &mut self.mode else {
             return Ok(());
         };
-        if self.finished {
+        if self.output_done {
             return Ok(());
         }
         if t.encoder.is_none() {
@@ -429,7 +433,7 @@ impl OutStream {
                 .frame_limit
                 .is_some_and(|limit| self.frames_out >= limit)
             {
-                self.finished = true;
+                self.output_done = true;
                 break;
             }
             self.position = self.position.max(f.end_seconds());
@@ -442,14 +446,14 @@ impl OutStream {
                 .frame_limit
                 .is_some_and(|limit| self.frames_out >= limit)
             {
-                self.finished = true;
+                self.output_done = true;
             }
         }
         Ok(())
     }
 
     fn push_packet(&mut self, packet: &Packet, sink: &mut Sink) -> Result<()> {
-        if self.finished || !matches!(self.mode, Mode::Copy) {
+        if self.input_done || self.output_done || !matches!(self.mode, Mode::Copy) {
             return Ok(());
         }
         let tb = self.input_info.time_base;
@@ -458,7 +462,7 @@ impl OutStream {
             Some(Trimmed2::Keep(p)) => p,
             Some(Trimmed2::Before) => return Ok(()),
             Some(Trimmed2::After) => {
-                self.finished = true;
+                self.input_done = true;
                 return Ok(());
             }
         };
@@ -466,7 +470,7 @@ impl OutStream {
             .frame_limit
             .is_some_and(|limit| self.frames_out >= limit)
         {
-            self.finished = true;
+            self.output_done = true;
             return Ok(());
         }
         self.position = self
@@ -692,7 +696,8 @@ fn setup_output(
             trim: Trim::new(spec.start, spec.duration, spec.to),
             frame_limit,
             frames_out: 0,
-            finished: false,
+            input_done: false,
+            output_done: false,
             position: 0.0,
             mode,
         });
@@ -848,7 +853,10 @@ pub fn run(global: &GlobalOptions, inputs: &[InputSpec], outputs: &[OutputSpec])
 
     let mut input_done = false;
     while !input_done {
-        if outs.iter().all(|o| o.streams.iter().all(|s| s.finished)) {
+        if outs
+            .iter()
+            .all(|o| o.streams.iter().all(|s| s.input_done || s.output_done))
+        {
             break;
         }
         let frames: Vec<(usize, Frame)> = match input.read()? {
